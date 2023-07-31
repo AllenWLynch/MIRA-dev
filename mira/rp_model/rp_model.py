@@ -1,37 +1,40 @@
 import numpy as np
 import logging
-from mira.adata_interface.rp_model import wraps_rp_func, add_isd_results, \
-    add_predictions, fetch_TSS_from_adata
-from mira.adata_interface.core import add_layer
+from mira.adata_interface.core import add_layer, add_obs_col
 import h5py as h5
 import os
-import glob
 from ._gene_model import GeneModel
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
+import pickle
 
 logger = logging.getLogger(__name__)
 
 
-def _generate_features(model, expr_adata, atac_adata):
-    pass
+def _pickle_load(file):
+    with open(file, 'rb') as f:
+        return pickle.load(f)
+    
+def _pickle_save(obj, file):
+    with open(file, 'wb') as f:
+        pickle.dump(obj, file)
 
 
-def _parallel_apply(func, n_jobs = 1, bar_desc = '',*, gene_models, expr_adata, atac_adata):
+def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', **feature_kw):
 
-    return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None)\
+    return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None, return_as = 'generator')\
                 ( delayed(func)(model, features) 
                   for model, features in tqdm(
-                        map(lambda model : _generate_features(model, expr_adata, atac_adata), gene_models), 
-                        desc = bar_desc, total = gene_models
+                        map(lambda x : (x, _generate_features(x, **feature_kw)), gene_models), 
+                        desc = bar_desc, total = len(gene_models)
                     )
                 )
 
 
-class BaseModel:
+class RPModel:
 
     @classmethod
-    def load_dir(cls,counts_layer = None,*,expr_model, accessibility_model, prefix):
+    def load(cls,counts_layer = None,*,expr_model, accessibility_model, filename):
         '''
         Load directory of RP models. Adds all available RP models into a container.
 
@@ -51,7 +54,7 @@ class BaseModel:
 
         .. code-block :: python
 
-            >>> litemodel = mira.rp.LITE_Model.load_dir(
+            >>> rpmodel = mira.rp.LITE_Model.load_dir(
             ...     counts_layer = 'counts',
             ...     expr_model = rna_model, 
             ...     accessibility_model = atac_model,
@@ -60,16 +63,11 @@ class BaseModel:
 
         '''
 
-        paths = glob.glob(prefix + '*.pth')
-
-        genes = [os.path.basename(x.split('_')[-1].split('.')[0]) 
-                for x in paths]
-
         model = cls(expr_model = expr_model, 
-                    seed = 0,
                     accessibility_model = accessibility_model,
                     counts_layer = counts_layer, 
-                    genes = genes).load(prefix)
+                    genes = [])\
+                ._load(filename)
 
         return model
 
@@ -136,6 +134,39 @@ class BaseModel:
                 GeneModel(gene)
             )
 
+    def _load(self, filename):
+
+        save_data = _pickle_load(filename)
+
+        for gene, data in save_data.items():
+
+            self.models.append(
+                GeneModel(gene = gene)._load_save_data(data)
+            )
+
+        return self
+    
+    def save(self, filename):
+        '''
+        Save RP models.
+
+        Parameters
+        ----------
+
+        prefix : str
+            Prefix under which to save RP models. May be filename prefix
+            or directory. RP models will save with format:
+            **{prefix}_{LITE/NITE}_{gene}.pth**
+
+        '''
+
+        save_data = {
+            model.gene : model._get_save_data()
+            for model in self.models
+        }
+
+        _pickle_save(save_data, filename)
+
 
     def subset(self, genes):
         '''
@@ -194,7 +225,7 @@ class BaseModel:
 
         '''
 
-        assert(isinstance(rp_model, BaseModel))
+        assert(isinstance(rp_model, RPModel))
 
         add_models = np.setdiff1d(rp_model.genes, self.genes)
 
@@ -204,6 +235,7 @@ class BaseModel:
             )
         
         return self
+
 
     def __getitem__(self, gene):
         '''
@@ -218,13 +250,16 @@ class BaseModel:
         '''
         return self.get_model(gene)
 
+
     @property
     def genes(self):
         return np.array([model.gene for model in self.models])
 
+
     @property
     def features(self):
         return self.genes
+
 
     def _get_masks(self, tss_distance):
 
@@ -233,39 +268,6 @@ class BaseModel:
 
         return upstream_mask, downstream_mask
 
-    @staticmethod
-    def bn(x, mu, var, eps):
-            return (x - mu)/np.sqrt( var + eps)
-
-    def _get_region_weights(self, NITE_features, softmax_denom, idx):
-        
-        model = self.accessibility_model
-
-        rate = model._get_gamma()[idx] * self.bn(
-            NITE_features.dot(model._get_beta()[:, idx]),
-            model._get_bn_mean()[idx],
-            model._get_bn_var()[idx],
-            model.decoder.bn.eps
-        ) + model._get_bias()[idx]
-
-        region_probabilities = np.exp(rate)/softmax_denom[:, np.newaxis]
-        return region_probabilities.cpu().numpy()
-
-    def save(self, prefix):
-        '''
-        Save RP models.
-
-        Parameters
-        ----------
-
-        prefix : str
-            Prefix under which to save RP models. May be filename prefix
-            or directory. RP models will save with format:
-            **{prefix}_{LITE/NITE}_{gene}.pth**
-
-        '''
-        for model in self.models:
-            model.save(prefix)
 
     def get_model(self, gene):
         '''
@@ -283,46 +285,9 @@ class BaseModel:
         except IndexError:
             raise IndexError('Model for gene {} does not exist'.format(gene))
 
-    def load(self, prefix):
-        '''
-        Load RP models saved with *prefix*.
-
-        Parameters
-        ----------
-
-        prefix : str
-            Prefix under which RP models were saved.
-
-        '''
-
-        genes = self.genes
-        self.models = []
-        for gene in genes:
-            try:
-                model = GeneModel(gene)
-                model.load(prefix)
-                self.models.append(model)
-            except FileNotFoundError:
-                logger.warn('Cannot load {} model. File not found.'.format(gene))
-
-        if len(self.models) == 0:
-            raise ValueError('No models loaded.')
-
-        return self
-
-    def _subset_fit_models(self, models):
-
-        self.models = []
-        for model in models:
-            if not model.was_fit:
-                logger.warn('{} model failed to fit.'.format(model.gene))
-            else:
-                self.models.append(model)
-
-        return self
 
     #@wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs : self._subset_fit_models(output), bar_desc = 'Fitting models')
-    def _fit(self,*, expr_adata, atac_adata):
+    def fit(self,*, expr_adata, atac_adata):
         '''
         Optimize parameters of RP models to learn *cis*-regulatory relationships.
 
@@ -343,24 +308,47 @@ class BaseModel:
  
         '''
 
-        return _parallel_apply(
-            lambda model, features : model.fit(**features),
+        def _apply(model, features):
+            return model.fit(**features)
+
+        return list(_parallel_apply(
+            _apply, self.models,
             n_jobs=self.n_jobs,
             expr_adata=expr_adata,
             atac_adata=atac_adata,
-        )
+            expr_model = self.expr_model,
+            accessibility_model = self.accessibility_model,
+            bar_desc='Fitting models'
+        ))
 
         
 
-    @wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs: np.array(output).sum(), bar_desc = 'Scoring')
-    def _score(self, model, features):
-        return model.score(features)
+    #wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs: np.array(output).sum(), bar_desc = 'Scoring')
+    def score(self,*,expr_adata, atac_adata):
+        
+        def _apply(model, features):
+            return model.score(**features)
+        
+        cell_scores = np.zeros(len(expr_adata))
+        gene_scores = np.empty(len(self.models))
+        
+        for i, per_cell_scores in enumerate(_parallel_apply(
+            _apply, self.models,
+            n_jobs=self.n_jobs,
+            expr_adata=expr_adata,
+            atac_adata=atac_adata,
+            expr_model = self.expr_model,
+            accessibility_model = self.accessibility_model,
+            bar_desc= 'Calculating deviances'
+        )):
+            
+            cell_scores = cell_scores + per_cell_scores
+            gene_scores[i] = per_cell_scores.sum()
+
+        return cell_scores, gene_scores
 
 
-    @wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs: \
-        add_predictions(expr_adata, (self.features, output), model_type = self.model_type, sparse = True),
-        bar_desc = 'Predicting expression')
-    def _predict(self, model, features):
+    def predict(self, expr_adata, atac_adata):
         '''
         Predicts the expression of genes given their *cis*-accessibility state.
         Also evaluates the probability of that prediction for LITE/NITE evaluation.
@@ -385,10 +373,23 @@ class BaseModel:
                 NITE model, respectively.
         
         '''
-        try:
-            return True, model.predict(features)
-        except ValueError:
-            return False, None
+        def _apply(model, features):
+            return model.predict(**features)
+
+        nite_predictions, lite_predictions = list(zip(*_parallel_apply(
+            _apply, self.models,
+            n_jobs=self.n_jobs,
+            expr_adata=expr_adata,
+            atac_adata=atac_adata,
+            expr_model = self.expr_model,
+            accessibility_model = self.accessibility_model,
+            bar_desc= 'Predicting expression'
+        )))
+
+        nite_predictions = np.hstack(nite_predictions)
+        lite_predictions = np.hstack(lite_predictions)
+
+        return nite_predictions, lite_predictions
 
 
     def fit_score_predict(self,*,expr_adata, atac_adata):
@@ -398,35 +399,23 @@ class BaseModel:
                 atac_adata = atac_adata
             )
         
-        def _train_test_split():
-            pass
+        np.random.seed(self.seed)
+        train_set = np.random.rand(len(expr_adata)) < 0.7
+
+        def subset_dictionary(data, mask):
+            return {k : v[mask] for k, v  in data.items()}
         
-        train, test = _train_test_split(**all_data)
+        train, test = subset_dictionary(all_data, train_set), subset_dictionary(all_data, ~train_set)
 
-        self.models = self._fit(**train)
+        self.models = self.fit(**train)
+        cell_scores, gene_scores = self.score(**test)
+        predictions = self.predict(**all_data)
 
-        per_gene_scores, per_cell_scores = self._score(**test)
-
-        predictions = self._predict(**all_data)
-
-        ## add adata stuff
-
-        return self 
+        return cell_scores, gene_scores, predictions 
 
 
-    @wraps_rp_func(lambda self, expr_adata, atac_adata, output, **kwargs : output, bar_desc = 'Formatting features')
-    def get_features(self, model, features):
-        return features
-
-
-    @wraps_rp_func(lambda self, expr_adata, atac_adata, output, **kwargs : output, 
-        bar_desc = 'Formatting features', include_factor_data = True)
-    def get_isd_features(self, model, features,*,hits_matrix, metadata):
-        return features
-
-
-    @wraps_rp_func(add_isd_results, 
-        bar_desc = 'Predicting TF influence', include_factor_data = True)
+    #@wraps_rp_func(add_isd_results, 
+    #    bar_desc = 'Predicting TF influence', include_factor_data = True)
     def probabilistic_isd(self, model, features, n_samples = 1500, checkpoint = None,
         *,hits_matrix, metadata):
         '''

@@ -10,6 +10,102 @@ from joblib import Parallel, delayed
 import pandas as pd
 logger = logging.getLogger(__name__)
 
+
+def _get_region_weights(model, NITE_features, softmax_denom, idx):
+
+    def _bn(x, mu, var, eps):
+        return (x - mu)/np.sqrt( var + eps)
+
+    rate = model._get_gamma()[idx] * _bn(
+        NITE_features.dot(model._get_beta()[:, idx]),
+        model._get_bn_mean()[idx],
+        model._get_bn_var()[idx],
+        model.decoder.bn.eps
+    ) + model._get_bias()[idx]
+
+    region_probabilities = np.exp(rate)/softmax_denom[:, np.newaxis]
+    return region_probabilities.cpu().numpy()
+
+
+def get_RP_model_features(self,*, expr_adata, atac_adata, atac_topic_comps_key = 'X_topic_compositions', 
+            factor_type = 'motifs', checkpoint = None, n_workers = 1, **kwargs):
+
+        assert(isinstance(n_workers, int) and (n_workers >= 1 or n_workers == -1))
+        assert len(expr_adata) == len(atac_adata), 'Must pass adatas with same number of cells to this function'
+        assert np.all(expr_adata.obs_names == atac_adata.obs_names), 'To use RP models, cells must have same barcodes/obs_names'
+
+        unannotated_genes = np.setdiff1d(self.genes, atac_adata.uns['distance_to_TSS_genes'])
+        if len(unannotated_genes) > 0:
+            raise ValueError('The following genes for RP modeling were not found in the TSS annotation: ' + ', '.join(unannotated_genes))
+
+        if not 'model_read_scale' in expr_adata.obs.columns:
+            self.expr_model._get_read_depth(expr_adata)
+
+        read_depth = expr_adata.obs_vector('model_read_scale')
+
+        batch_correction = self.expr_model.decoder.is_correcting
+
+        if not 'softmax_denom' in expr_adata.obs.columns:
+            self.expr_model._get_softmax_denom(expr_adata, include_batcheffects = True)
+
+        if not 'batch_effect' in expr_adata.layers and batch_correction:
+            self.expr_model.get_batch_effect(expr_adata)
+
+        expr_softmax_denom = expr_adata.obs_vector('softmax_denom')
+
+        if not 'softmax_denom' in atac_adata.obs.columns:
+            self.accessibility_model._get_softmax_denom(atac_adata, include_batcheffects = False)
+
+        atac_softmax_denom = atac_adata.obs_vector('softmax_denom')
+
+        if not atac_topic_comps_key in atac_adata.obsm:
+            self.accessibility_model.predict(atac_adata, add_key = atac_topic_comps_key, add_cols = False)
+
+        NITE_features = atac_adata.obsm[atac_topic_comps_key]
+
+        if not 'distance_to_TSS' in atac_adata.varm:
+            raise Exception('Peaks have not been annotated with TSS locations. Run "get_distance_to_TSS" before proceeding.')
+
+        distance_matrix = atac_adata[:, self.accessibility_model.features].varm['distance_to_TSS'].T #genes, #regions
+
+        hits_data = dict()
+        if include_factor_data:
+            hits_data = fetch_factor_hits(self.accessibility_model, atac_adata, factor_type = factor_type,
+                binarize = True)
+
+        if include_factor_data and not checkpoint is None:
+            logger.warn('Resuming pISD from checkpoint. If wanting to recalcuate, use a new checkpoint file, or set checkpoint to None.')
+            kwargs['checkpoint'] = checkpoint
+
+        get_model_features_function = partial(set_up_model, atac_adata = atac_adata,
+            expr_adata = expr_adata, distance_matrix = distance_matrix, read_depth = read_depth, 
+            expr_softmax_denom = expr_softmax_denom, NITE_features = NITE_features, 
+            atac_softmax_denom = atac_softmax_denom, include_factor_data = include_factor_data,
+            batch_correction = batch_correction, self = self)
+
+        if n_workers == 1:
+            
+            results = [
+                func(self, model, get_model_features_function(model.gene), **hits_data, **kwargs)
+                for model in tqdm(self.models, desc =bar_desc)
+            ]
+
+        else:
+            
+            def feature_producer():
+                for model in self.models:
+                    yield model, get_model_features_function(model.gene)
+
+            results = Parallel(n_jobs=n_workers, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None)\
+                (delayed(func)(self, model, features, **hits_data, **kwargs) 
+                for model, features in tqdm(feature_producer(), desc = bar_desc, total = len(self.models)))
+
+        return adata_adder(self, expr_adata, atac_adata, results, factor_type = factor_type)
+
+    return get_RP_model_features
+
+
+
 def add_predictions(adata, output, model_type = 'LITE', sparse = True):
 
     features, predictions = output

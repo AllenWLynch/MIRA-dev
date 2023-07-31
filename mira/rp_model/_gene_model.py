@@ -5,14 +5,6 @@ from scipy.sparse import isspmatrix
 from mira.adata_interface import rp_model as rpi
 from mira.adata_interface import core as adi
 
-def _pickle_load(file):
-    with open(file, 'rb') as f:
-        return pickle.load(f)
-    
-def _pickle_save(obj, file):
-    with open(file, 'wb') as f:
-        pickle.dump(obj, file)
-
 
 class GeneModel:
     '''
@@ -28,11 +20,9 @@ class GeneModel:
     def prefix(self):
         return self.gene
     
-
     def fit(self, features):
         self._params = fit_models(**features)
         return self
-    
 
     def predict(self, features):
         model_scores, model_logrates = score(features)
@@ -41,30 +31,15 @@ class GeneModel:
     def score(self, features):
         model_scores, model_logrates = score(**self._params, **features)
         return model_scores
-    
+
     def predict_and_score(self, features):
         return score(**self._params, **features)
 
-    def get_savename(self, prefix):
-        return prefix + self.prefix + '.pth'
-
     def _get_save_data(self):
         return self._params
-    
+
     def _load_save_data(self, data):
         self._params = data
-
-
-    def save(self, prefix):
-        _pickle_save(
-            self._get_save_data(), 
-            self.get_savename(prefix)
-        )
-
-
-    def load(self, prefix):
-        state = _pickle_load(self.get_savename(prefix))
-        self._load_save_data(state)
 
 
     @staticmethod

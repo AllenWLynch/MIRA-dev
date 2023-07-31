@@ -1,9 +1,6 @@
 import numpy as np
 import logging
-from mira.adata_interface.core import add_layer, add_obs_col
-import h5py as h5
-import os
-from ._gene_model import GeneModel
+from ._gene_model import fit_models, score, fit_and_score
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 import pickle
@@ -20,14 +17,13 @@ def _pickle_save(obj, file):
         pickle.dump(obj, file)
 
 
-def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', **feature_kw):
+def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', parallel = None, **feature_kw):
+
+    feature_generator = map(lambda model : (model, _generate_features(model, **feature_kw)), gene_models)
 
     return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None, return_as = 'generator')\
-                ( delayed(func)(model, features) 
-                  for model, features in tqdm(
-                        map(lambda x : (x, _generate_features(x, **feature_kw)), gene_models), 
-                        desc = bar_desc, total = len(gene_models)
-                    )
+                ( delayed(func)(**model, **features) 
+                  for model, features in tqdm(feature_generator, desc = bar_desc, total = len(gene_models))
                 )
 
 
@@ -75,8 +71,10 @@ class RPModel:
     def __init__(self,seed = 0,*,
         expr_model, 
         accessibility_model, 
-        genes,
+        genes = None,
         counts_layer = None,
+        train_split = 0.7,
+        models = None,
         n_jobs = 1):
         '''
         Parameters
@@ -120,30 +118,35 @@ class RPModel:
             >>> rp_args = dict(expr_adata = rna_data, atac_adata = atac_data)
 
         '''
+        num_nones = (not models is None) + (not genes is None)
+        assert num_nones == 1, 'Must provide either "genes" or "models" to instantiate RPModel object'
 
         self.seed = seed
         self.n_jobs = n_jobs,
         self.expr_model = expr_model
         self.accessibility_model = accessibility_model
         self.counts_layer = counts_layer
+        self.train_split = train_split
 
-        self.models = []
-        for gene in genes:
+        if models is None:
+            self.models = {
+                gene : {} for gene in genes
+            }
+        else:
+            self.models = models
 
-            self.models.append(
-                GeneModel(gene)
-            )
+    
+    @property
+    def genes(self):
+        return np.array(list(self.models.keys()))
+
+
+    @property
+    def features(self):
+        return self.genes
 
     def _load(self, filename):
-
-        save_data = _pickle_load(filename)
-
-        for gene, data in save_data.items():
-
-            self.models.append(
-                GeneModel(gene = gene)._load_save_data(data)
-            )
-
+        self.models = _pickle_load(filename)
         return self
     
     def save(self, filename):
@@ -159,13 +162,7 @@ class RPModel:
             **{prefix}_{LITE/NITE}_{gene}.pth**
 
         '''
-
-        save_data = {
-            model.gene : model._get_save_data()
-            for model in self.models
-        }
-
-        _pickle_save(save_data, filename)
+        _pickle_save(self.models, filename)
 
 
     def subset(self, genes):
@@ -188,8 +185,10 @@ class RPModel:
         
         '''
         assert(isinstance(genes, (list, np.ndarray)))
+        modeled_genes = self.genes
+        
         for gene in genes:
-            if not gene in self.genes:
+            if not gene in modeled_genes:
                 raise ValueError('Gene {} is not in RP model'.format(str(gene)))        
 
 
@@ -197,9 +196,13 @@ class RPModel:
             expr_model = self.expr_model,
             accessibility_model = self.accessibility_model, 
             counts_layer=self.counts_layer, 
-            models = [model for model in self.models if model.gene in genes]
+            train_split= self.train_split,
+            models = {
+                gene : model for gene, model in self.models.items() if gene in genes
+            }
         )
     
+
     def join(self, rp_model):
         '''
         Merge RP models from two model containers.
@@ -230,10 +233,8 @@ class RPModel:
         add_models = np.setdiff1d(rp_model.genes, self.genes)
 
         for add_gene in add_models:
-            self.models.append(
-                rp_model.get_model(add_gene)
-            )
-        
+            self.models[add_gene] = rp_model.get_model(add_gene)
+            
         return self
 
 
@@ -249,16 +250,6 @@ class RPModel:
 
         '''
         return self.get_model(gene)
-
-
-    @property
-    def genes(self):
-        return np.array([model.gene for model in self.models])
-
-
-    @property
-    def features(self):
-        return self.genes
 
 
     def _get_masks(self, tss_distance):
@@ -281,13 +272,26 @@ class RPModel:
 
         '''
         try:
-            return self.models[np.argwhere(self.genes == gene)[0,0]]
+            return self.models[gene]
         except IndexError:
             raise IndexError('Model for gene {} does not exist'.format(gene))
+        
 
+    def _apply(self, fn, expr_adata, atac_adata, bar_desc = ''):
 
+        return _parallel_apply(
+            fn, self.models.items(),
+            n_jobs=self.n_jobs,
+            expr_adata=expr_adata,
+            atac_adata=atac_adata,
+            expr_model = self.expr_model,
+            accessibility_model = self.accessibility_model,
+            bar_desc = bar_desc,
+        )
+
+        
     #@wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs : self._subset_fit_models(output), bar_desc = 'Fitting models')
-    def fit(self,*, expr_adata, atac_adata):
+    def _fit(self,*, expr_adata, atac_adata):
         '''
         Optimize parameters of RP models to learn *cis*-regulatory relationships.
 
@@ -307,189 +311,68 @@ class RPModel:
             RP model with optimized parameters
  
         '''
+        return list(self._apply(fit_models, expr_adata, atac_adata, bar_desc='Fitting models'))
+    
+    
+    def _score_predict(self,*, expr_adata, atac_adata, include_cell_mask = None):
 
-        def _apply(model, features):
-            return model.fit(**features)
+        num_cells = include_cell_mask.sum() if not include_cell_mask is None else len(expr_adata)
 
-        return list(_parallel_apply(
-            _apply, self.models,
-            n_jobs=self.n_jobs,
-            expr_adata=expr_adata,
-            atac_adata=atac_adata,
-            expr_model = self.expr_model,
-            accessibility_model = self.accessibility_model,
-            bar_desc='Fitting models'
-        ))
+        cell_scores = np.empty( (num_cells, 3) )
+        gene_scores = np.empty( (3, len(self.models)) )
 
-        
+        lite_predictions = np.empty( (num_cells, len(self.genes)) )
+        nite_predictions = lite_predictions.copy()
 
-    #wraps_rp_func(lambda self, expr_adata, atac_data, output, **kwargs: np.array(output).sum(), bar_desc = 'Scoring')
-    def score(self,*,expr_adata, atac_adata):
-        
-        def _apply(model, features):
-            return model.score(**features)
-        
-        cell_scores = np.zeros(len(expr_adata))
-        gene_scores = np.empty(len(self.models))
-        
-        for i, per_cell_scores in enumerate(_parallel_apply(
-            _apply, self.models,
-            n_jobs=self.n_jobs,
-            expr_adata=expr_adata,
-            atac_adata=atac_adata,
-            expr_model = self.expr_model,
-            accessibility_model = self.accessibility_model,
-            bar_desc= 'Calculating deviances'
-        )):
+        for i, (per_cell_scores, logrates) in enumerate(
+            self._apply(score, expr_adata, atac_adata, 
+                        bar_desc= 'Calculating deviances')
+        ):
+            
+            per_cell_scores = np.hstack(per_cell_scores)[include_cell_mask]
             
             cell_scores = cell_scores + per_cell_scores
-            gene_scores[i] = per_cell_scores.sum()
+            gene_scores[:,i] = per_cell_scores.sum(0)
 
-        return cell_scores, gene_scores
-
-
-    def predict(self, expr_adata, atac_adata):
-        '''
-        Predicts the expression of genes given their *cis*-accessibility state.
-        Also evaluates the probability of that prediction for LITE/NITE evaluation.
-
-        Parameters
-        ----------
-
-        expr_adata : anndata.AnnData
-            AnnData of expression features
-        atac_adata : anndata.AnnData
-            AnnData of accessibility features. Must be annotated with 
-            mira.tl.get_distance_to_TSS.
-
-        Returns
-        -------
-
-        anndata.AnnData
-            `.layers['LITE_prediction']` or `.layers['NITE_prediction']`: np.ndarray[float] of shape (n_cells, n_features)
-                Predicted relative frequencies of features using LITE or NITE model, respectively
-            `.layers['LTIE_logp']` or `.layers['NITE_logp']` : np.ndarray[float] of shape (n_cells, n_features)
-                Probability of observed expression given posterior predictive estimate of LITE or
-                NITE model, respectively.
-        
-        '''
-        def _apply(model, features):
-            return model.predict(**features)
-
-        nite_predictions, lite_predictions = list(zip(*_parallel_apply(
-            _apply, self.models,
-            n_jobs=self.n_jobs,
-            expr_adata=expr_adata,
-            atac_adata=atac_adata,
-            expr_model = self.expr_model,
-            accessibility_model = self.accessibility_model,
-            bar_desc= 'Predicting expression'
-        )))
-
-        nite_predictions = np.hstack(nite_predictions)
-        lite_predictions = np.hstack(lite_predictions)
-
-        return nite_predictions, lite_predictions
-
-
-    def fit_score_predict(self,*,expr_adata, atac_adata):
-        
-        all_data = dict(
-                expr_adata = expr_adata, 
-                atac_adata = atac_adata
-            )
-        
-        np.random.seed(self.seed)
-        train_set = np.random.rand(len(expr_adata)) < 0.7
-
-        def subset_dictionary(data, mask):
-            return {k : v[mask] for k, v  in data.items()}
-        
-        train, test = subset_dictionary(all_data, train_set), subset_dictionary(all_data, ~train_set)
-
-        self.models = self.fit(**train)
-        cell_scores, gene_scores = self.score(**test)
-        predictions = self.predict(**all_data)
-
-        return cell_scores, gene_scores, predictions 
-
-
-    #@wraps_rp_func(add_isd_results, 
-    #    bar_desc = 'Predicting TF influence', include_factor_data = True)
-    def probabilistic_isd(self, model, features, n_samples = 1500, checkpoint = None,
-        *,hits_matrix, metadata):
-        '''
-        For each gene, calcuate association scores with each transcription factor.
-        Association scores detect when a TF binds within *cis*-regulatory
-        elements (CREs) that are influential to expression predictions for that gene.
-        CREs that influence the RP model expression prediction are nearby a 
-        gene's TSS and have accessibility that correlates with expression. This
-        model assumes these attributes indicate a factor is more likely to 
-        regulate a gene. 
-
-        Parameters
-        ----------
-
-        expr_adata : anndata.AnnData
-            AnnData of expression features
-        atac_adata : anndata.AnnData
-            AnnData of accessibility features. Must be annotated with TSS and factor
-            binding data using mira.tl.get_distance_to_TSS **and** 
-            mira.tl.get_motif_hits_in_peaks/mira.tl.get_CHIP_hits_in_peaks.
-        n_samples : int>0, default=1500
-            Downsample cells to this amount for calculations. Speeds up computation
-            time. Cells are sampled by stratifying over expression levels.
-        checkpoint : str, default = None
-            Path to checkpoint h5 file. pISD calculations can be slow, and saving
-            a checkpoint ensures progress is not lost if calculations are 
-            interrupted. To resume from a checkpoint, just pass the path to the h5.
-
-        Returns
-        -------
-
-        anndata.AnnData
-            `.varm['motifs-prob_deletion']` or `.varm['chip-prob_deletion']`: np.ndarray[float] of shape (n_genes, n_factors)
-                Association scores for each gene-TF combination. Higher scores indicate
-                greater predicted association/regulatory influence.
-
-        '''
-
-        already_calculated = False
-        if not checkpoint is None:
-            if not os.path.isfile(checkpoint):
-                h5.File(checkpoint, 'w').close()
-
-            with h5.File(checkpoint, 'r') as h:
-                try:
-                    h[model.gene]
-                    already_calculated = True
-                except KeyError:
-                    pass
-
-        if checkpoint is None or not already_calculated:
-            result = model.probabilistic_isd(features, hits_matrix, n_samples = n_samples)
-
-            if not checkpoint is None:
-                with h5.File(checkpoint, 'a') as h:
-                    g = h.create_group(model.gene)
-                    g.create_dataset('samples_mask', data = result[1])
-                    g.create_dataset('isd', data = result[0])
-
-            return result
-        else:
-            with h5.File(checkpoint, 'r') as h:
-                g = h[model.gene]
-                result = g['isd'][...], g['samples_mask'][...]
-
-            return result
-
-    @property
-    def parameters_(self):
-        '''
-        Returns parameters of all contained RP models.
-        '''
-        return {
-            gene : self[gene]._params
-            for gene in self.features
-        }
+            nite_predictions[:,i] = logrates[0]
+            lite_predictions[:,i] = logrates[1]
     
+        return (cell_scores, gene_scores), (nite_predictions, lite_predictions)
+    
+
+
+    def _fit_score_predict(self,*,expr_adata, atac_adata):
+                
+        train_set = np.random.RandomState(self.seed).rand(len(expr_adata)) < self.test_split
+        test_set = ~train_set
+
+        cell_scores = np.empty( (test_set.sum(), 3) )
+        gene_scores = np.empty( (3, len(self.features)) )
+
+        lite_predictions = np.empty( (len(expr_adata), len(self.features)) )
+        nite_predictions = lite_predictions.copy()
+
+        def _apply(**kw):
+            return fit_and_score(train_mask=train_set, **kw)
+        
+        models = []
+
+        for i, (model, per_cell_scores, logrates) in enumerate(
+            self._apply(_apply, expr_adata, atac_adata, 
+                        bar_desc= 'Progress')
+        ):
+            models.append(model)
+            per_cell_scores = np.hstack(per_cell_scores)[test_set]
+            
+            cell_scores = cell_scores + per_cell_scores
+            gene_scores[:,i] = per_cell_scores.sum(0)
+
+            nite_predictions[:,i] = logrates[0]
+            lite_predictions[:,i] = logrates[1]
+    
+        return {
+            'models' : dict(zip(self.genes, models)), 
+            'scores' : (cell_scores, gene_scores), 
+            'predictions' : (nite_predictions, lite_predictions),
+            'train_set' : train_set,
+        }

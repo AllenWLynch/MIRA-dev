@@ -4,6 +4,8 @@ from ._gene_model import fit_models, score, fit_and_score
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 import pickle
+from mira.adata_interface.rp_model import get_feature_generator
+
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +19,15 @@ def _pickle_save(obj, file):
         pickle.dump(obj, file)
 
 
-def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', parallel = None, **feature_kw):
+def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', **feature_kw):
 
-    feature_generator = map(lambda model : (model, _generate_features(model, **feature_kw)), gene_models)
+    feature_generator = get_feature_generator(**feature_kw)
+    model_generator = map(lambda x : (x, feature_generator(x['gene'])), gene_models)
 
     return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None, return_as = 'generator')\
                 ( delayed(func)(**model, **features) 
-                  for model, features in tqdm(feature_generator, desc = bar_desc, total = len(gene_models))
+                  for model, features in tqdm(model_generator, 
+                                              desc = bar_desc, total = len(gene_models))
                 )
 
 

@@ -1,13 +1,13 @@
 import logging
-import inspect
 from functools import partial, wraps
 import numpy as np
-from mira.adata_interface.core import project_matrix, add_layer
+from mira.adata_interface.core import project_matrix, add_layer, fetch_layer
 from mira.adata_interface.regulators import fetch_peaks, fetch_factor_hits
 from tqdm.auto import tqdm
 from scipy import sparse
-from joblib import Parallel, delayed
 import pandas as pd
+from mira.topic_model.ilr_tools import centered_boxcox_transform
+from scipy.sparse import isspmatrix
 logger = logging.getLogger(__name__)
 
 
@@ -24,64 +24,147 @@ def _get_region_weights(model, NITE_features, softmax_denom, idx):
     ) + model._get_bias()[idx]
 
     region_probabilities = np.exp(rate)/softmax_denom[:, np.newaxis]
-    return region_probabilities.cpu().numpy()
+    return region_probabilities
 
 
-def get_RP_model_features(self,*, expr_adata, atac_adata, atac_topic_comps_key = 'X_topic_compositions', 
-            factor_type = 'motifs', checkpoint = None, n_workers = 1, **kwargs):
+def _set_up_genemodel(gene_name,*, 
+    atac_X,
+    atac_read_depth,
+    atac_adata, 
+    expr_adata, 
+    expr_model, atac_model,
+    distance_matrix, 
+    read_scale, 
+    expr_softmax_denom,
+    atac_softmax_denom,
+    NITE_features, 
+    ):
 
-        assert(isinstance(n_workers, int) and (n_workers >= 1 or n_workers == -1))
-        assert len(expr_adata) == len(atac_adata), 'Must pass adatas with same number of cells to this function'
-        assert np.all(expr_adata.obs_names == atac_adata.obs_names), 'To use RP models, cells must have same barcodes/obs_names'
+    try:
+        gene_idx = np.argwhere(np.array(atac_adata.uns['distance_to_TSS_genes']) == gene_name)[0,0]
+    except IndexError:
+        raise IndexError('Gene {} does not appear in peak annotation'.format(gene_name))
 
-        unannotated_genes = np.setdiff1d(self.genes, atac_adata.uns['distance_to_TSS_genes'])
-        if len(unannotated_genes) > 0:
-            raise ValueError('The following genes for RP modeling were not found in the TSS annotation: ' + ', '.join(unannotated_genes))
+    try:
+        gene_expr = expr_adata.obs_vector(gene_name, layer = expr_model.counts_layer)
 
-        if not 'model_read_scale' in expr_adata.obs.columns:
-            self.expr_model._get_read_depth(expr_adata)
+        assert(np.isclose(gene_expr.astype(np.int64), gene_expr, 1e-2).all()), 'Input data must be raw transcript counts, represented as integers. Provided data contains non-integer values.'
+        gene_expr = gene_expr.astype(int)
 
-        read_depth = expr_adata.obs_vector('model_read_scale')
+        if 'batch_effect' in expr_adata.layers:
+            correction_vector = expr_adata.obs_vector(gene_name, layer = 'batch_effect')
+        else:
+            correction_vector = np.zeros_like(gene_expr)
+        
+    except KeyError:
+        raise KeyError('Gene {} is not found in expression data var_names'.format(gene_name))
+    
+    exposure = np.exp(
+        read_scale + correction_vector - np.log(expr_softmax_denom)
+    )
 
-        batch_correction = self.expr_model.decoder.is_correcting
+    peak_idx = distance_matrix[gene_idx, :].indices
+    tss_distance = distance_matrix[gene_idx, :].data
 
-        if not 'softmax_denom' in expr_adata.obs.columns:
-            self.expr_model._get_softmax_denom(expr_adata, include_batcheffects = True)
+    distance_sort = tss_distance.argsort()[::-1]
+    tss_distance = tss_distance[distance_sort]
+    peak_idx = peak_idx[distance_sort]
 
-        if not 'batch_effect' in expr_adata.layers and batch_correction:
-            self.expr_model.get_batch_effect(expr_adata)
+    model_features = {
+        'distance' : np.abs(tss_distance)/10000,
+        'is_upstream' : tss_distance <= 0,
+        'idx' : peak_idx,
+        'exposure' : exposure,
+        'y' : gene_expr,
+        'global_features' : NITE_features,
+        'X' : atac_X[:,peak_idx].tocsr()/atac_read_depth[:,np.newaxis]*10000,
+        'smoothed' : _get_region_weights(atac_model, NITE_features, atac_softmax_denom, peak_idx)*10000,
+    }
 
-        expr_softmax_denom = expr_adata.obs_vector('softmax_denom')
+    return model_features
 
-        if not 'softmax_denom' in atac_adata.obs.columns:
-            self.accessibility_model._get_softmax_denom(atac_adata, include_batcheffects = False)
 
-        atac_softmax_denom = atac_adata.obs_vector('softmax_denom')
+def get_feature_generator(*, expr_adata, atac_adata, 
+            expr_model, accessibility_model,
+            atac_topic_comps_key = 'X_topic_compositions', 
+            factor_type = 'motifs', 
+            checkpoint = None):
 
-        if not atac_topic_comps_key in atac_adata.obsm:
-            self.accessibility_model.predict(atac_adata, add_key = atac_topic_comps_key, add_cols = False)
+    assert len(expr_adata) == len(atac_adata), 'Must pass adatas with same number of cells to this function'
+    assert np.all(expr_adata.obs_names == atac_adata.obs_names), 'To use RP models, cells must have same barcodes/obs_names'
 
-        NITE_features = atac_adata.obsm[atac_topic_comps_key]
+    #convert to sparse CSC format for faster access
+    if expr_model.counts_layer is None:
+        expr_adata.X = expr_adata.X.tocsc()
+    else:
+        expr_adata.layers[expr_model.counts_layer] = expr_adata.layers[expr_model.counts_layer].tocsc()
 
-        if not 'distance_to_TSS' in atac_adata.varm:
-            raise Exception('Peaks have not been annotated with TSS locations. Run "get_distance_to_TSS" before proceeding.')
+    if not 'model_read_scale' in expr_adata.obs.columns:
+        expr_model._get_read_depth(expr_adata)
+    read_depth = expr_adata.obs_vector('model_read_scale')
 
-        distance_matrix = atac_adata[:, self.accessibility_model.features].varm['distance_to_TSS'].T #genes, #regions
+    if not 'softmax_denom' in expr_adata.obs.columns:
+        expr_model._get_softmax_denom(expr_adata, include_batcheffects = True)
+    expr_softmax_denom = expr_adata.obs_vector('softmax_denom')
 
-        hits_data = dict()
-        if include_factor_data:
-            hits_data = fetch_factor_hits(self.accessibility_model, atac_adata, factor_type = factor_type,
-                binarize = True)
+    is_correcting = expr_model.decoder.is_correcting
+    if not 'batch_effect' in expr_adata.layers and is_correcting:
+        expr_model.get_batch_effect(expr_adata)
 
-        if include_factor_data and not checkpoint is None:
-            logger.warn('Resuming pISD from checkpoint. If wanting to recalcuate, use a new checkpoint file, or set checkpoint to None.')
-            kwargs['checkpoint'] = checkpoint
+
+    if not 'softmax_denom' in atac_adata.obs.columns:
+        accessibility_model._get_softmax_denom(atac_adata, include_batcheffects = False)
+    atac_softmax_denom = atac_adata.obs_vector('softmax_denom')
+
+    if not atac_topic_comps_key in atac_adata.obsm:
+        accessibility_model.predict(atac_adata, add_key = atac_topic_comps_key, add_cols = False)        
+    NITE_features = centered_boxcox_transform(
+        atac_adata.obsm[atac_topic_comps_key]
+    )
+
+    if not 'distance_to_TSS' in atac_adata.varm:
+        raise Exception('Peaks have not been annotated with TSS locations. Run "get_distance_to_TSS" before proceeding.')
+    
+    distance_matrix = atac_adata[:, accessibility_model.features].varm['distance_to_TSS'].T #genes, #regions
+
+    #atac_X = fetch_layer(None, atac_adata, layer = accessibility_model.counts_layer)
+
+    print('here')
+    if isspmatrix(atac_adata.X):
+        print('there')
+        logger.info('Converting ATAC matrix to sparse CSC format')
+        atac_X =  atac_adata[:, accessibility_model.features].X.tocsc()
+
+    atac_read_depth = atac_X.sum(axis = 1).A1
+
+    return partial(_set_up_genemodel, 
+            distance_matrix = distance_matrix,
+            read_scale = read_depth,
+            expr_softmax_denom = expr_softmax_denom,
+            atac_softmax_denom = atac_softmax_denom,
+            NITE_features = NITE_features,
+            expr_model = expr_model,
+            atac_model = accessibility_model,
+            expr_adata = expr_adata,
+            atac_adata = atac_adata,
+            atac_read_depth = atac_read_depth,
+            atac_X = atac_X,
+            )
+
+    '''hits_data = dict()
+    if include_factor_data:
+        hits_data = fetch_factor_hits(self.accessibility_model, atac_adata, factor_type = factor_type,
+            binarize = True)
+    
+    if include_factor_data and not checkpoint is None:
+        logger.warn('Resuming pISD from checkpoint. If wanting to recalcuate, use a new checkpoint file, or set checkpoint to None.')
+        kwargs['checkpoint'] = checkpoint
 
         get_model_features_function = partial(set_up_model, atac_adata = atac_adata,
             expr_adata = expr_adata, distance_matrix = distance_matrix, read_depth = read_depth, 
             expr_softmax_denom = expr_softmax_denom, NITE_features = NITE_features, 
             atac_softmax_denom = atac_softmax_denom, include_factor_data = include_factor_data,
-            batch_correction = batch_correction, self = self)
+            batch_correction = is_correcting, self = self)
 
         if n_workers == 1:
             
@@ -102,7 +185,7 @@ def get_RP_model_features(self,*, expr_adata, atac_adata, atac_topic_comps_key =
 
         return adata_adder(self, expr_adata, atac_adata, results, factor_type = factor_type)
 
-    return get_RP_model_features
+    return get_RP_model_features'''
 
 
 
@@ -201,157 +284,6 @@ def fetch_TSS_from_adata(self, adata):
         return tss_metadata[self.gene]
     except KeyError:
         raise KeyError('Gene {} not in TSS annotation.'.format(self.gene))
-
-
-def set_up_model(gene_name, atac_adata, expr_adata, 
-    distance_matrix, read_depth, expr_softmax_denom,
-    NITE_features, atac_softmax_denom, include_factor_data,
-    batch_correction, self):
-
-    try:
-        gene_idx = np.argwhere(np.array(atac_adata.uns['distance_to_TSS_genes']) == gene_name)[0,0]
-    except IndexError:
-        raise IndexError('Gene {} does not appear in peak annotation'.format(gene_name))
-
-    try:
-        gene_expr = expr_adata.obs_vector(gene_name, layer = self.counts_layer)
-
-        assert(np.isclose(gene_expr.astype(np.int64), gene_expr, 1e-2).all()), 'Input data must be raw transcript counts, represented as integers. Provided data contains non-integer values.'
-        gene_expr = gene_expr.astype(int)
-
-        if batch_correction:
-            correction_vector = expr_adata.obs_vector(gene_name, layer = 'batch_effect')
-        else:
-            correction_vector = np.zeros_like(gene_expr)
-        
-    except KeyError:
-        raise KeyError('Gene {} is not found in expression data var_names'.format(gene_name))
-
-    peak_idx = distance_matrix[gene_idx, :].indices
-    tss_distance = distance_matrix[gene_idx, :].data
-
-    model_features = {}
-    for region_name, mask in zip(['promoter','upstream','downstream'], self._get_masks(tss_distance)):
-        model_features[region_name + '_idx'] = peak_idx[mask]
-        model_features[region_name + '_distances'] = np.abs(tss_distance[mask])
-
-    model_features.pop('promoter_distances')
-
-    return self._get_features_for_model(
-                        gene_expr = gene_expr,
-                        read_depth = read_depth,
-                        correction_vector = correction_vector,
-                        expr_softmax_denom = expr_softmax_denom,
-                        NITE_features = NITE_features,
-                        atac_softmax_denom = atac_softmax_denom,
-                        include_factor_data = include_factor_data,
-                        **model_features,
-                        )
-
-
-def wraps_rp_func(adata_adder = lambda self, expr_adata, atac_adata, output, **kwargs : None, 
-    bar_desc = '', include_factor_data = False):
-
-    def wrap_fn(func):
-
-        def rp_signature(*, expr_adata, atac_adata, n_workers = 1, atac_topic_comps_key = 'X_topic_compositions'):
-            pass
-
-        def isd_signature(*, expr_adata, atac_adata, n_workers = 1, checkpoint = None, 
-            atac_topic_comps_key = 'X_topic_compositions', factor_type = 'motifs'):
-            pass
-
-        func_signature = inspect.signature(func).parameters.copy()
-        func_signature.pop('model')
-        func_signature.pop('features')
-        
-        if include_factor_data:
-            mock = inspect.signature(isd_signature).parameters.copy()
-        else:
-            mock = inspect.signature(rp_signature).parameters.copy()
-
-        func_signature.update(mock)
-        func.__signature__ = inspect.Signature(list(func_signature.values()))
-        
-        @wraps(func)
-        def get_RP_model_features(self,*, expr_adata, atac_adata, atac_topic_comps_key = 'X_topic_compositions', 
-            factor_type = 'motifs', checkpoint = None, n_workers = 1, **kwargs):
-
-            assert(isinstance(n_workers, int) and (n_workers >= 1 or n_workers == -1))
-            assert len(expr_adata) == len(atac_adata), 'Must pass adatas with same number of cells to this function'
-            assert np.all(expr_adata.obs_names == atac_adata.obs_names), 'To use RP models, cells must have same barcodes/obs_names'
-
-            unannotated_genes = np.setdiff1d(self.genes, atac_adata.uns['distance_to_TSS_genes'])
-            if len(unannotated_genes) > 0:
-                raise ValueError('The following genes for RP modeling were not found in the TSS annotation: ' + ', '.join(unannotated_genes))
-
-            if not 'model_read_scale' in expr_adata.obs.columns:
-                self.expr_model._get_read_depth(expr_adata)
-
-            read_depth = expr_adata.obs_vector('model_read_scale')
-
-            batch_correction = self.expr_model.decoder.is_correcting
-
-            if not 'softmax_denom' in expr_adata.obs.columns:
-                self.expr_model._get_softmax_denom(expr_adata, include_batcheffects = True)
-
-            if not 'batch_effect' in expr_adata.layers and batch_correction:
-                self.expr_model.get_batch_effect(expr_adata)
-
-            expr_softmax_denom = expr_adata.obs_vector('softmax_denom')
-
-            if not 'softmax_denom' in atac_adata.obs.columns:
-                self.accessibility_model._get_softmax_denom(atac_adata, include_batcheffects = False)
-
-            atac_softmax_denom = atac_adata.obs_vector('softmax_denom')
-
-            if not atac_topic_comps_key in atac_adata.obsm:
-                self.accessibility_model.predict(atac_adata, add_key = atac_topic_comps_key, add_cols = False)
-
-            NITE_features = atac_adata.obsm[atac_topic_comps_key]
-
-            if not 'distance_to_TSS' in atac_adata.varm:
-                raise Exception('Peaks have not been annotated with TSS locations. Run "get_distance_to_TSS" before proceeding.')
-
-            distance_matrix = atac_adata[:, self.accessibility_model.features].varm['distance_to_TSS'].T #genes, #regions
-
-            hits_data = dict()
-            if include_factor_data:
-                hits_data = fetch_factor_hits(self.accessibility_model, atac_adata, factor_type = factor_type,
-                    binarize = True)
-
-            if include_factor_data and not checkpoint is None:
-                logger.warn('Resuming pISD from checkpoint. If wanting to recalcuate, use a new checkpoint file, or set checkpoint to None.')
-                kwargs['checkpoint'] = checkpoint
-
-            get_model_features_function = partial(set_up_model, atac_adata = atac_adata,
-                expr_adata = expr_adata, distance_matrix = distance_matrix, read_depth = read_depth, 
-                expr_softmax_denom = expr_softmax_denom, NITE_features = NITE_features, 
-                atac_softmax_denom = atac_softmax_denom, include_factor_data = include_factor_data,
-                batch_correction = batch_correction, self = self)
-
-            if n_workers == 1:
-                
-                results = [
-                    func(self, model, get_model_features_function(model.gene), **hits_data, **kwargs)
-                    for model in tqdm(self.models, desc =bar_desc)
-                ]
-
-            else:
-                
-                def feature_producer():
-                    for model in self.models:
-                        yield model, get_model_features_function(model.gene)
-
-                results = Parallel(n_jobs=n_workers, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None)\
-                    (delayed(func)(self, model, features, **hits_data, **kwargs) 
-                    for model, features in tqdm(feature_producer(), desc = bar_desc, total = len(self.models)))
-
-            return adata_adder(self, expr_adata, atac_adata, results, factor_type = factor_type)
-
-        return get_RP_model_features
-
-    return wrap_fn
 
 
 def add_isd_results(self, expr_adata, atac_adata, output, factor_type = 'motifs', **kwargs):

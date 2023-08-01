@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.optimize import minimize, Bounds
 from sklearn.preprocessing import StandardScaler
-import time
 from scipy.special import gammaln, digamma, xlogy
 
 def _decay_to_distance(gamma):
@@ -133,7 +132,7 @@ def fit_rp_model(reg,*,
     std = mu/np.sqrt(reg)
     beta = mu + std*z
     
-    return res, (a, beta, b, theta)
+    return res, (a, beta, b, theta), (gamma1, gamma2)
 
 
 def _fit_nb_regression(*, y, exposure, features, theta,

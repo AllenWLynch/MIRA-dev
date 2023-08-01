@@ -100,7 +100,7 @@ def fit_and_score(reg = np.inf, *,train_mask, **features):
     
     model = fit_models(reg = reg, 
                        **{k : v[train_mask].copy() if k in cell_features else v
-                          for k,v in features
+                          for k,v in features.items()
                          }
                       )
     
@@ -161,7 +161,7 @@ def _select_informative_samples(expression, n_bins = 20, n_samples = 1500, seed 
     return np.concatenate(informative_samples)
 
 
-@staticmethod
+
 def _prob_ISD(hits_matrix,*, correction_vector,
     upstream_weights, downstream_weights, 
     promoter_weights, upstream_idx, promoter_idx, downstream_idx,
@@ -285,8 +285,6 @@ def _get_RP_model_coordinates(self, bin_size = 50,
     return x, y
 
 
-@adi.wraps_modelfunc(fetch_TSS_from_adata, 
-    fill_kwargs = ['gene_chrom','gene_start','gene_end','gene_strand'])
 def write_bedgraph(self, bin_size = 50,
     decay_periods = 20, promoter_width = 3000,*, save_name,
     gene_chrom, gene_start, gene_end, gene_strand):
@@ -328,8 +326,6 @@ def write_bedgraph(self, bin_size = 50,
 
 
 
-@adi.wraps_modelfunc(rpi.fetch_get_influential_local_peaks, rpi.return_peaks_by_idx,
-    fill_kwargs=['peak_idx','tss_distance'])
 def get_influential_local_peaks(self, peak_idx, tss_distance, decay_periods = 5):
     '''
     Returns the `.var` field of the adata, but subset for only peaks within 

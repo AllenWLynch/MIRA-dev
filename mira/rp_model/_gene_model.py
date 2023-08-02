@@ -22,7 +22,7 @@ def fit_models(reg = np.inf, *, X, y, exposure, smoothed, global_features,
     # 2. fit RP model with initialized intercept, dispersion
     _, (a, beta, b, theta), (gamma_up, gamma_down) = fit_rp_model(reg, 
                                 X = X, y = y, exposure=exposure,
-                                distance = distance, is_upstream= is_upstream, 
+                                distance = distance, is_upstream=is_upstream, 
                                 init_params = [0.25, 0.069, 0.069, b_int, theta_int * 2] + [0.]*n_peaks
                             )
     

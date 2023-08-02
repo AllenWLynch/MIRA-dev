@@ -37,7 +37,7 @@ def _set_up_genemodel(gene_name,*,
     read_scale, 
     expr_softmax_denom,
     atac_softmax_denom,
-    NITE_features, 
+    atac_topics, 
     ):
 
     try:
@@ -76,9 +76,9 @@ def _set_up_genemodel(gene_name,*,
         'idx' : peak_idx,
         'exposure' : exposure,
         'y' : gene_expr,
-        'global_features' : NITE_features,
         'X' : atac_X[:,peak_idx].tocsr()/atac_read_depth[:,np.newaxis]*10000,
-        'smoothed' : _get_region_weights(atac_model, NITE_features, atac_softmax_denom, peak_idx)*10000,
+        'smoothed' : _get_region_weights(atac_model, atac_topics, atac_softmax_denom, peak_idx)*10000,
+        'global_features' : np.log(atac_topics),
     }
 
     return model_features
@@ -92,12 +92,6 @@ def get_feature_generator(*, expr_adata, atac_adata,
 
     assert len(expr_adata) == len(atac_adata), 'Must pass adatas with same number of cells to this function'
     assert np.all(expr_adata.obs_names == atac_adata.obs_names), 'To use RP models, cells must have same barcodes/obs_names'
-
-    #convert to sparse CSC format for faster access
-    if expr_model.counts_layer is None:
-        expr_adata.X = expr_adata.X.tocsc()
-    else:
-        expr_adata.layers[expr_model.counts_layer] = expr_adata.layers[expr_model.counts_layer].tocsc()
 
     if not 'model_read_scale' in expr_adata.obs.columns:
         expr_model._get_read_depth(expr_adata)
@@ -118,9 +112,7 @@ def get_feature_generator(*, expr_adata, atac_adata,
 
     if not atac_topic_comps_key in atac_adata.obsm:
         accessibility_model.predict(atac_adata, add_key = atac_topic_comps_key, add_cols = False)        
-    NITE_features = centered_boxcox_transform(
-        atac_adata.obsm[atac_topic_comps_key]
-    )
+    atac_topics = atac_adata.obsm[atac_topic_comps_key]
 
     if not 'distance_to_TSS' in atac_adata.varm:
         raise Exception('Peaks have not been annotated with TSS locations. Run "get_distance_to_TSS" before proceeding.')
@@ -129,9 +121,7 @@ def get_feature_generator(*, expr_adata, atac_adata,
 
     #atac_X = fetch_layer(None, atac_adata, layer = accessibility_model.counts_layer)
 
-    print('here')
     if isspmatrix(atac_adata.X):
-        print('there')
         logger.info('Converting ATAC matrix to sparse CSC format')
         atac_X =  atac_adata[:, accessibility_model.features].X.tocsc()
 
@@ -142,7 +132,7 @@ def get_feature_generator(*, expr_adata, atac_adata,
             read_scale = read_depth,
             expr_softmax_denom = expr_softmax_denom,
             atac_softmax_denom = atac_softmax_denom,
-            NITE_features = NITE_features,
+            atac_topics = atac_topics,
             expr_model = expr_model,
             atac_model = accessibility_model,
             expr_adata = expr_adata,

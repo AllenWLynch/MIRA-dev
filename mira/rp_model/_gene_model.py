@@ -34,7 +34,7 @@ def fit_models(reg = np.inf, *, X, y, exposure, smoothed, global_features,
                              exposure = exposure, 
                              smoothed = smoothed, 
                              beta = beta,
-                             init_params = (a,b),
+                             init_params = (b,a),
                              theta = theta,
                             )
     a = max(a, 0.) # if the unconstrained MLE estimate for a is lt 0, set to 0.
@@ -97,12 +97,13 @@ def score(*,intercept_model, fit_model, saturated_model,
 def fit_and_score(reg = np.inf, *,train_mask, **features):
     
     cell_features = ['X','y','exposure','smoothed','global_features']
+
+    def _mask_features(features, mask):
+        return {k : v[mask].copy() if k in cell_features else v
+                for k,v in features.items()
+               }
     
-    model = fit_models(reg = reg, 
-                       **{k : v[train_mask].copy() if k in cell_features else v
-                          for k,v in features.items()
-                         }
-                      )
+    model = fit_models(reg = reg, **_mask_features(features, train_mask))
     
     logps, logrates = score(**model, **features)
 
@@ -112,7 +113,6 @@ def fit_and_score(reg = np.inf, *,train_mask, **features):
 def generalized_r2(saturated_logp, fit_logp, intercept_logp):
     return 1 -  (saturated_logp.sum() - fit_logp.sum())/(saturated_logp.sum() - intercept_logp.sum())
     
-
 
 def _select_informative_samples(expression, n_bins = 20, n_samples = 1500, seed = 2556):
     '''

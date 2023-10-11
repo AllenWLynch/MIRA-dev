@@ -22,9 +22,12 @@ def _pickle_save(obj, file):
 def _parallel_apply(func, gene_models, n_jobs = 1, bar_desc = '', **feature_kw):
 
     feature_generator = get_feature_generator(**feature_kw)
-    model_generator = map(lambda x : (x, feature_generator(x['gene'])), gene_models)
+    # iterates over (gene_name, model) pairs
+    # *lazily*, so that all of the features for all of the models are not created at once.
+    model_generator = map(lambda x : (x[1], feature_generator(x[0])), gene_models ) 
 
-    return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', max_nbytes = None, return_as = 'generator')\
+    return Parallel(n_jobs=n_jobs, verbose=0, pre_dispatch='2*n_jobs', 
+                    max_nbytes = None, return_as = 'generator', backend='threading')\
                 ( delayed(func)(**model, **features) 
                   for model, features in tqdm(model_generator, 
                                               desc = bar_desc, total = len(gene_models))
@@ -126,7 +129,7 @@ class RPModel:
         assert num_nones == 1, 'Must provide either "genes" or "models" to instantiate RPModel object'
 
         self.seed = seed
-        self.n_jobs = n_jobs,
+        self.n_jobs = n_jobs
         self.expr_model = expr_model
         self.accessibility_model = accessibility_model
         self.counts_layer = counts_layer

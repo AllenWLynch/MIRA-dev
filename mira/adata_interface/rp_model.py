@@ -69,6 +69,8 @@ def _set_up_genemodel(gene_name,*,
     distance_sort = tss_distance.argsort()[::-1]
     tss_distance = tss_distance[distance_sort]
     peak_idx = peak_idx[distance_sort]
+    peak_names = atac_adata.var_names[peak_idx]
+
 
     model_features = {
         'distance' : np.abs(tss_distance)/10000,
@@ -79,6 +81,9 @@ def _set_up_genemodel(gene_name,*,
         'X' : atac_X[:,peak_idx].tocsr()/atac_read_depth[:,np.newaxis]*10000,
         'smoothed' : _get_region_weights(atac_model, atac_topics, atac_softmax_denom, peak_idx)*10000,
         'global_features' : np.log(atac_topics),
+        'peak_attrs' : {
+            'peak_names' : peak_names,
+        }
     }
 
     return model_features

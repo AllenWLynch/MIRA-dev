@@ -2,6 +2,10 @@ import numpy as np
 from scipy.optimize import minimize, Bounds
 from sklearn.preprocessing import StandardScaler
 from scipy.special import gammaln, digamma, xlogy
+import logging
+from os.path import basename
+logger = logging.getLogger(basename(__name__))
+
 
 def _decay_to_distance(gamma):
     return -np.log(1/2)/gamma
@@ -55,6 +59,7 @@ def fit_rp_model(reg,*,
             X, y, exposure,
             distance, is_upstream, 
             prior_beta =  1, prior_alpha = 0,
+            max_time = np.inf,
             init_params = None,**kw):
     
     _, n_peaks = X.shape
@@ -99,10 +104,10 @@ def fit_rp_model(reg,*,
         dL_dtheta = digamma(y + theta).sum() - len(y)*digamma(theta) - np.sum( (y + theta)/(_lambda + theta) )\
                     - np.log(_lambda + theta).sum() + len(y)*(1 + np.log(theta))
         
-        #dL_dz  = a*std*np.array(error.T @ X) - z
+        dL_dz  = a*std*np.array(error.T @ X) - z
         
         jac = np.concatenate(
-            [ dL_da[0], dL_dg1[0], dL_dg2[0], dL_db[0], np.array([dL_dtheta]), np.zeros(X.shape[1]) ],#np.squeeze(dL_dz),],
+            [ dL_da[0], dL_dg1[0], dL_dg2[0], dL_db[0], np.array([dL_dtheta]), np.squeeze(dL_dz)],
             axis = 0
         )
 
@@ -121,8 +126,12 @@ def fit_rp_model(reg,*,
                 [0.,1e-3,1e-3, -np.inf, 1e-3] + [-np.inf]*n_peaks, 
                 [np.inf]*(n_peaks+5), 
                 keep_feasible=True
-            )
+            ),
+            options = dict(maxiter = 250, maxfun = 500),
         )
+    
+    if not res.success:
+        logger.warning(f"RP model optimization failed: {res.message}")
         
         
     (a, gamma1, gamma2, b, theta), z = res.x[:5], res.x[5:]
@@ -132,7 +141,7 @@ def fit_rp_model(reg,*,
     std = mu/np.sqrt(reg)
     beta = mu + std*z
     
-    return res, (a, beta, b, theta), (gamma1, gamma2)
+    return res, (a, beta, b, theta), (gamma1, gamma2), z
 
 
 def _fit_nb_regression(*, y, exposure, features, theta,
